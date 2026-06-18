@@ -1,0 +1,18 @@
+# --- Web framework ---
+fastapi
+uvicorn[standard]
+
+# --- Database / ORM ---
+sqlalchemy
+psycopg2-binary
+pgvector
+
+# --- Document processing ---
+langchain
+# RecursiveCharacterTextSplitter lives here in recent LangChain versions.
+# `langchain` re-exports it, but pinning the package avoids import surprises.
+langchain-text-splitters
+
+# --- Config / validation ---
+python-dotenv
+pydantic
