@@ -6,20 +6,27 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.database import get_db, init_db
-from app.services.ingestion import chunk_document
+from app.config import settings
+from app.database import get_db, verify_schema
+from app.services.embeddings import (
+    EmbeddingClient,
+    EmbeddingError,
+    get_embedding_client,
+)
+from app.services.ingestion import ingest_document
+from app.services.retrieval import search
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Verify the pgvector extension + tables exist before any request is served.
-    init_db()
+    # Fail at boot with instructions rather than mid-request with a traceback.
+    verify_schema()
     yield
 
 
 app = FastAPI(
     title="Autonomous RAG Engine",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -36,27 +43,51 @@ class IngestResponse(BaseModel):
     chunks_created: int
 
 
+class QueryRequest(BaseModel):
+    question: str = Field(..., min_length=1, examples=["What is the PTO policy?"])
+    top_k: int | None = Field(default=None, ge=1, le=50)
+    document_name: str | None = Field(
+        default=None, description="Restrict the search to one document."
+    )
+
+
+class Match(BaseModel):
+    chunk_id: str
+    document_name: str
+    chunk_text: str
+    # Cosine distance: 0.0 is identical, 1.0 is unrelated. Returned so a bad
+    # answer can be diagnosed as retrieval failure vs. generation failure.
+    distance: float
+
+
+class QueryResponse(BaseModel):
+    question: str
+    matches: list[Match]
+
+
 # Endpoints
 
 @app.get("/")
 def health_check():
     """Liveness probe."""
-    return {"status": "ok", "service": "rag-ingestion"}
+    return {"status": "ok", "service": "rag-engine", "version": app.version}
 
 
 @app.post("/ingest", response_model=IngestResponse)
-def ingest(payload: IngestRequest, db: Session = Depends(get_db)):
-    """Chunk raw text and persist each chunk (with a mock embedding)."""
-    chunks = chunk_document(payload.filename, payload.content)
-
-    if not chunks:
-        # Empty / whitespace-only content produces no chunks; nothing to store.
-        return IngestResponse(document_name=payload.filename, chunks_created=0)
-
+def ingest(
+    payload: IngestRequest,
+    db: Session = Depends(get_db),
+    client: EmbeddingClient = Depends(get_embedding_client),
+):
+    """Chunk, embed, and store a document. Re-ingesting replaces its chunks."""
     try:
-        for chunk in chunks:
-            db.add(chunk)
+        chunks_created = ingest_document(
+            db, client, payload.filename, payload.content
+        )
         db.commit()
+    except EmbeddingError as exc:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 - roll back, then surface as 500
         db.rollback()
         raise HTTPException(
@@ -65,5 +96,37 @@ def ingest(payload: IngestRequest, db: Session = Depends(get_db)):
 
     return IngestResponse(
         document_name=payload.filename,
-        chunks_created=len(chunks),
+        chunks_created=chunks_created,
+    )
+
+
+@app.post("/query", response_model=QueryResponse)
+def query(
+    payload: QueryRequest,
+    db: Session = Depends(get_db),
+    client: EmbeddingClient = Depends(get_embedding_client),
+):
+    """Return the stored chunks most semantically similar to the question."""
+    try:
+        hits = search(
+            db,
+            client,
+            question=payload.question,
+            top_k=payload.top_k or settings.default_top_k,
+            document_name=payload.document_name,
+        )
+    except EmbeddingError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return QueryResponse(
+        question=payload.question,
+        matches=[
+            Match(
+                chunk_id=hit.chunk_id,
+                document_name=hit.document_name,
+                chunk_text=hit.chunk_text,
+                distance=hit.distance,
+            )
+            for hit in hits
+        ],
     )

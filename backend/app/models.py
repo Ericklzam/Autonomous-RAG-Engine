@@ -6,12 +6,13 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import Column, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 
+from app.config import settings
 from app.database import Base
 
-# OpenAI text-embedding-3-small / text-embedding-ada-002 produce 1536-dim
-# vectors. Real embeddings arrive in Sprint 2; chunks are stored with zeros
-# for now (see services/ingestion.py).
-EMBEDDING_DIM = 1536
+# Single source of truth is `settings.embedding_dim`; re-exported here because
+# the embedding and ingestion services validate against it. Changing it
+# requires a migration -- the Vector column width is fixed at DDL time.
+EMBEDDING_DIM = settings.embedding_dim
 
 
 class DocumentChunk(Base):
